@@ -1,0 +1,170 @@
+name: nightly-build
+
+# gh workflow run deploy_cpu_docker
+# This also runs on release deploy
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+  pull_request:
+
+env:
+  CUDA_VERSION: 13.1.0
+  DRIVER_VERSION: 590
+  CUDA_COMPUTE_CAP: 120
+
+permissions:
+  contents: write
+  discussions: write
+  packages: write
+  
+
+jobs:
+    inference-test:
+      runs-on: ubuntu-24.04-arm
+      concurrency:
+        group: inference-test
+        cancel-in-progress: true
+      steps:
+        - name: checkout
+          uses: actions/checkout@v6          
+
+        - name: Restore cache
+          uses: actions/cache/restore@v5
+          with:
+            path: |
+              ~/.cargo/registry
+              ~/.cargo/git
+              target
+            key: inference-test
+            
+        - name: Build and run example
+          shell: bash
+          run: |
+            cargo run --release --package mistralrs --example qwen3_06b
+
+    build:
+      needs: inference-test
+      strategy:
+        fail-fast: false
+        matrix:
+          opts: [
+            # {name: "macos",                           runner: "macos-latest",      target: "",                          features: "--features accelerate,metal",            cpu: "native" },
+            # {name: "windows-x86_64-intel",            runner: "windows-latest",    target: "",                          features: "",                                       cpu: "arrowlake"},
+            # {name: "windows-x86_64-zen4_5_xeon",      runner: "windows-latest",    target: "",                          features: "",                                       cpu: "zen4"},
+            # {name: "windows-x86_64-cuda",             runner: "windows-latest",    target: "",                          features: "--features cuda,flash-attn",             cpu: "arrowlake"},
+            # {name: "linux-x86_64-intel",              runner: "ubuntu-24.04",      target: "x86_64-unknown-linux-gnu",  features: "",                                       cpu: "arrowlake"},
+            # {name: "linux-x86_64-zen4_5_xeon",        runner: "ubuntu-24.04",      target: "x86_64-unknown-linux-gnu",  features: "",                                       cpu: "zen4"},
+            {name: "linux-x86_64-cuda",               runner: "ubuntu-24.04",      target: "x86_64-unknown-linux-gnu",  features: "--features cuda,cudnn,flash-attn",       cpu: "arrowlake"},
+            # {name: "linux-x86_64-cuda-nccl",          runner: "ubuntu-24.04",      target: "x86_64-unknown-linux-gnu",  features: "--features cuda,cudnn,flash-attn,nccl",  cpu: "arrowlake"},
+            # {name: "linux-aarch64",                   runner: "ubuntu-24.04-arm",  target: "aarch64-unknown-linux-gnu", features: "",                                       cpu: "cortex-a76"},
+            # {name: "linux-aarch64-cuda",              runner: "ubuntu-24.04-arm",  target: "aarch64-unknown-linux-gnu", features: "--features cuda,cudnn,flash-attn",       cpu: "cortex-a76"},
+          ]
+      concurrency:
+        group: ${{ matrix.opts.name }}
+        cancel-in-progress: true
+      runs-on: ${{ matrix.opts.runner}}
+      name: ${{ matrix.opts.name }}
+      env: 
+        CUDA_LOG_FILE: stdout 
+        RUST_BACKTRACE: 1
+      steps:
+        - name: checkout
+          uses: actions/checkout@v6          
+
+        - name: Restore cache
+          uses: actions/cache/restore@v5
+          with:
+            path: |
+              ~/.cargo/registry
+              ~/.cargo/git
+              target
+            key: ${{matrix.opts.name}}
+
+        - name: install cuda  
+          if: contains( matrix.opts.name, 'cuda' )  && contains( matrix.opts.name, 'windows')
+          uses: Jimver/cuda-toolkit@v0.2.30
+          with:
+            cuda: ${{env.CUDA_VERSION}}
+
+        - name: Install cuda linux
+          if: contains( matrix.opts.name, 'cuda' ) && contains( matrix.opts.name, 'linux')
+          run: |
+            wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/$(uname -m)/cuda-keyring_1.1-1_all.deb
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            sudo apt update
+            sudo apt install nvidia-driver-pinning-${{env.DRIVER_VERSION}}
+            sudo apt install libnvidia-compute nvidia-dkms-open cuda-toolkit cudnn9
+            echo "PATH=${PATH}:/usr/local/cuda/bin" >> $GITHUB_ENV
+
+        - name: Build linux
+          # if: contains( matrix.opts.name, 'linux') || contains( matrix.opts.name, 'macos')
+          shell: bash
+          run: |
+            export PATH=${PATH}:/usr/local/cuda/bin
+            cargo build --target ${{  matrix.opts.target }} --release ${{ matrix.opts.features }} 
+            mv target/${{  matrix.opts.target }}/release/mistralrs-server "target/release/mistralrs-server-${{matrix.opts.name}}"
+            mv target/${{  matrix.opts.target }}/release/mistralrs-bench "target/release/mistralrs-bench-${{matrix.opts.name}}"
+            mv target/${{  matrix.opts.target }}/release/mistralrs-web-chat "target/release/mistralrs-web-chat-${{matrix.opts.name}}"
+          env:
+            RUSTFLAGS: "-C target-cpu=${{ matrix.opts.cpu }} -C target-feature=-sse4a"
+            CUDA_HOME: /usr/local/cuda
+
+        - uses: actions/upload-artifact@v6
+          with:
+            name: ${{ matrix.opts.name }}
+            path: |
+              target/release/mistralrs-server-${{matrix.opts.name}}
+              target/release/mistralrs-bench-${{matrix.opts.name}}
+              target/release/mistralrs-web-chat-${{matrix.opts.name}}
+
+        - name: Save Cache
+          if: always()
+          uses: actions/cache/save@v5
+          with:
+            path: |
+              ~/.cargo/registry
+              ~/.cargo/git
+              target
+            key: ${{matrix.opts.name}}
+
+
+              
+    release:
+      name: release dev version
+      needs:
+        [build]
+      runs-on: ubuntu-latest
+      steps:
+        - name: Download artifacts
+          uses: actions/download-artifact@v6
+          with:
+            path: ./
+            merge-multiple: true
+
+        - name: Release version
+          id: version
+          run: |
+            version=$(cargo pkgid | sed -e "s/.*\@//" | sed -e "s/.*\#//");
+            echo "version=${version}-dev" >> "$GITHUB_OUTPUT"
+
+        - id: date
+          run: echo date=$(date +"%Y-%m-%dT%H:%M:%S%z") >> "$GITHUB_OUTPUT"
+
+        - name: delete old release
+          run: |
+            gh release delete ${{steps.version.outputs.version}} --cleanup-tag -y || echo no previous release
+          env:
+            GH_TOKEN: ${{ github.token }}
+
+        - name: Release
+          uses: softprops/action-gh-release@v2
+          with:
+            tag_name: ${{steps.version.outputs.version}}
+            body: |
+              Bleeding 🩸 edge dev release.
+              ${{steps.version.outputs.version}} ${{steps.date.outputs.date}}
+            files: |
+              mistralrs**
+            prerelease: true
+            repository: krampenschiesser/mistral.rs
