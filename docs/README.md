@@ -67,3 +67,7 @@
 ## Cross-device inference
 - [Device mapping](DEVICE_MAPPING.md)
 - [Topology](TOPOLOGY.md)
+
+## Builds and releases
+
+- [Nightly](NIGHTLY.md)
